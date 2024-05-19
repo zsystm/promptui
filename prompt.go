@@ -10,6 +10,9 @@ import (
 	"github.com/zsystm/promptui/screenbuf"
 )
 
+const default_prompt_placehold_size = 4
+const default_error_prompt_size = 3
+
 // Prompt represents a single line text field input with options for validation and input masks.
 type Prompt struct {
 	// Label is the value displayed on the command line prompt.
@@ -33,9 +36,6 @@ type Prompt struct {
 	// allows hiding private information like passwords.
 	Mask rune
 
-	// HideEntered sets whether to hide the text after the user has pressed enter.
-	HideEntered bool
-
 	// Templates can be used to customize the prompt output. If nil is passed, the
 	// default templates are used. See the PromptTemplates docs for more info.
 	Templates *PromptTemplates
@@ -50,8 +50,8 @@ type Prompt struct {
 	// the Pointer defines how to render the cursor.
 	Pointer Pointer
 
-	Stdin  io.ReadCloser
-	Stdout io.WriteCloser
+	stdin  io.ReadCloser
+	stdout io.WriteCloser
 }
 
 // PromptTemplates allow a prompt to be customized following stdlib
@@ -117,15 +117,20 @@ type PromptTemplates struct {
 // value. It will return the value and an error if any occurred during the prompt's execution.
 func (p *Prompt) Run() (string, error) {
 	var err error
-
+	// label should be only string
+	labelStr, ok := p.Label.(string)
+	if !ok {
+		return "", ErrAbort
+	}
+	promptLen := default_prompt_placehold_size + len(labelStr)
 	err = p.prepareTemplates()
 	if err != nil {
 		return "", err
 	}
 
 	c := &readline.Config{
-		Stdin:          p.Stdin,
-		Stdout:         p.Stdout,
+		Stdin:          p.stdin,
+		Stdout:         p.stdout,
 		EnableMask:     p.Mask != 0,
 		MaskRune:       p.Mask,
 		HistoryLimit:   -1,
@@ -144,6 +149,7 @@ func (p *Prompt) Run() (string, error) {
 	}
 	// we're taking over the cursor,  so stop showing it.
 	rl.Write([]byte(hideCursor))
+
 	sb := screenbuf.New(rl)
 
 	validFn := func(x string) error {
@@ -160,9 +166,13 @@ func (p *Prompt) Run() (string, error) {
 	}
 	eraseDefault := input != "" && !p.AllowEdit
 	cur := NewCursor(input, p.Pointer, eraseDefault)
-
+	cursorLen := len(cur.Cursor([]rune{}))
 	listen := func(input []rune, pos int, key rune) ([]rune, int, bool) {
 		_, _, keepOn := cur.Listen(input, pos, key)
+		// if keepOn is false, we should return immediately
+		if !keepOn {
+			return nil, 0, keepOn
+		}
 		err := validFn(cur.Get())
 		var prompt []byte
 
@@ -179,16 +189,20 @@ func (p *Prompt) Run() (string, error) {
 		if p.Mask != 0 {
 			echo = cur.FormatMask(p.Mask)
 		}
-
 		prompt = append(prompt, []byte(echo)...)
+
 		sb.Reset()
-		sb.Write(prompt)
+		// some cursor might have extra rune in the end of line
+		sb.WriteLineWrap(prompt, len(cur.input)+promptLen+cursorLen)
+
 		if inputErr != nil {
+			len := default_error_prompt_size + len(inputErr.Error())
 			validation := render(p.Templates.validation, inputErr)
-			sb.Write(validation)
+
+			sb.WriteLineWrap(validation, len)
 			inputErr = nil
 		}
-		sb.Flush()
+		sb.FlushLineWrap()
 		return nil, 0, keepOn
 	}
 
@@ -197,15 +211,14 @@ func (p *Prompt) Run() (string, error) {
 	for {
 		_, err = rl.Readline()
 		inputErr = validFn(cur.Get())
+
 		if inputErr == nil {
 			break
 		}
-
 		if err != nil {
 			break
 		}
 	}
-
 	if err != nil {
 		switch err {
 		case readline.ErrInterrupt:
@@ -217,16 +230,16 @@ func (p *Prompt) Run() (string, error) {
 			err = ErrInterrupt
 		}
 		sb.Reset()
-		sb.WriteString("")
-		sb.Flush()
 		rl.Write([]byte(showCursor))
 		rl.Close()
+
 		return "", err
 	}
 
-	echo := cur.Get()
+	// this is when input value is correct, we don't show cursor
+	echo := string(cur.input)
 	if p.Mask != 0 {
-		echo = cur.GetMask(p.Mask)
+		echo = cur.FormatMaskNoCursor(p.Mask)
 	}
 
 	prompt := render(p.Templates.success, p.Label)
@@ -239,18 +252,11 @@ func (p *Prompt) Run() (string, error) {
 			err = ErrAbort
 		}
 	}
-
-	if p.HideEntered {
-		clearScreen(sb)
-	} else {
-		sb.Reset()
-		sb.Write(prompt)
-		sb.Flush()
-	}
-
+	sb.Reset()
+	sb.WriteLineWrap(prompt, len(cur.input)+promptLen)
+	sb.FlushLineWrap()
 	rl.Write([]byte(showCursor))
 	rl.Close()
-
 	return cur.Get(), err
 }
 
